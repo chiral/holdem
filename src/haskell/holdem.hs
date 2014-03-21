@@ -5,6 +5,9 @@ module Main where
 
 import Data.Maybe
 import Data.List as L
+import Data.IntMap (IntMap)
+import Data.IntMap ((!))
+import qualified Data.IntMap as M
 import Data.Char
 
 import Control.Monad
@@ -12,8 +15,7 @@ import Control.Monad.State
 
 import System.Random
 
-update :: Int -> a -> [a] -> [a]
-update k v lis = take k lis ++ [v] ++ drop (k+1) lis
+type IM = M.IntMap
 
 -- Cards
 
@@ -47,113 +49,168 @@ shuffle rs xs = snd.unzip $ L.sortBy (\x y->compare (fst x) (fst y)) $ L.zip rs 
 
 -- Game
 
-type Player = Int -- 0 - (N-1)
-type NumPlayers = Int
-type BtnPos = (NumPlayers,Int)
+type Player = Int -- 0 - (NumSeats-1)
 type Score = Int
-type Blind = (Score,Score)
+type Blind = [Score] -- SB,BB
 type Ante = Score
 
-data Stage = Preflop | Flop | Turn | River | ShowDown 
-             deriving (Eq,Enum,Show)
+data PlayerState = Away | Folded | Active | Allin
+                 deriving (Show,Enum,Eq)
 
-data TableState = Table {
-      btnPos :: BtnPos,
+data Table = Table { 
+      scores :: IM Score,
+      btn :: Player,
       ante :: Ante,
-      blind :: Blind,
-      scores :: [Score] -- player -> current score
+      blind :: Blind
     } deriving (Show)
 
-type TS = TableState
+data GameState = GameState { 
+      players :: IM PlayerState, 
+      hand :: IM Cards,
+      deck :: Cards,
+      board :: Cards,
+      pot :: IM Score,
+      minBet :: Score,
+      current :: Player
+    } deriving (Show)
+
+type GS = GameState
+type TS = StateT Table IO
 
 initAnte = 0
-initBlind = (5,10)
+initBlind = [5,10]
 initScore = 1000
 
-initTable :: NumPlayers -> TS
-initTable np = Table { btnPos=(np,0),
-                       ante=initAnte,
-                       blind=initBlind,
-                       scores=L.replicate np initScore }
+initTable :: Int -> Table
+initTable np = 
+    Table { 
+      scores=M.fromList $ zip [0..] $ L.replicate np initScore,
+      btn=0,
+      ante=initAnte,
+      blind=initBlind
+    }
 
-nplayers = fst.btnPos
+takes :: Int -> Int -> [a] -> [[a]]
+takes 0 _ lis = []
+takes n m lis = take m lis:takes (n-1) m (drop m lis)
 
-type AllIn = Bool
+initGameState :: Cards -> TS GS
+initGameState cards = do
+    t <- get
+    let ss = scores t
+        n = M.size ss
+        onSeats = map (\i->(i,(ss!i)>0)) [0..n-1]
+        conv f (p,b) x = if b then (p,x) else (p,f x)
+        forPlayers f = M.fromList . zipWith (conv f) onSeats
+    return GameState { 
+      players=forPlayers (const Away) $ repeat Active,
+      hand=forPlayers id $ takes n 2 cards,
+      deck=drop (2*n) cards,
+      board=[],
+      pot=forPlayers id $ repeat 0,
+      minBet=0, 
+      current=btn t
+    }
 
-data Board = Board { 
-      board :: Cards,
-      deck :: Cards,
-      hand :: [Cards], -- player -> cards in hand
-      active :: [Player], 
-      allin :: [Player], 
-      bet :: Score,
-      pot :: [Score] -- player -> amount bet in a game
-    } deriving (Show)
+doBet :: Player -> Score -> GS -> TS GS
+doBet p s gs = do
+  t <- get
+  let score = scores t ! p
+      bet = min s score
+      allin x = if bet==score then Allin else x
+  put t { scores=M.adjust (+(-bet)) p $ scores t }
+  return gs { players=M.adjust allin p $ players gs,
+              pot=M.adjust (+bet) p $ pot gs,
+              minBet=s }
 
-takes :: Int -> Int -> [a] -> ([[a]],[a])
-takes 0 _ lis = ([],lis)
-takes n m lis = (a:fst r,snd r) 
-    where (a,b)=splitAt m lis
-          r = takes (n-1) m b
+type Bets = [(Player,Score)]
 
-initBoard :: Cards -> State TS Board
-initBoard cards = do
-  ts <- get
-  let (np,btn) = btnPos ts
-      (hand1,deck1) = takes np 3 cards
-      sb = (btn+1) `mod` np
-      (a,b) = splitAt sb [0..np-1]
-  return $ Board { 
-               board=[],
-               deck=deck1,
-               hand=hand1,
-               active=b++a,
-               allin=[],
-               bet=0,
-               pot=replicate np 0 }
+doBets :: Bets -> GS -> TS GS
+doBets bets gs = foldM (flip ($)) gs bet_actions
+  where bet_actions = map (uncurry doBet) bets
 
-doBet :: Board -> Score -> State TS Board
-doBet b s = do
-  ts <- get
-  let (p:active1) = active b
-      bet1 = min s $ scores ts !! p
-      s1 = (scores ts !! p) - bet1
-      pot1 = (pot b !! p) + bet1
-      (p1,a1) = if s1==0 then ([p],[]) else ([],[p])
-  put $ ts { scores=update p s1 $ scores ts }
-  return b { active=active1++p1,
-             allin=allin b++a1, bet=s,
-             pot=update p pot1 $ pot b }
+doAnteBets :: GS -> TS GS
+doAnteBets gs = do
+  t <- get
+  let ps = players gs
+      active = L.filter ((==Active).(ps!)) $ M.keys ps
+  flip doBets gs $ zip active (repeat $ ante t)
 
-doAnte :: Board -> State TS Board
-doAnte b = do
-  ts <- get
-  let np = nplayers ts
-  foldM doBet b $ replicate np $ ante ts
+first :: (a->Bool) -> [a] -> a
+first f = head . (L.filter) f 
 
-doBlind :: Board -> State TS Board
-doBlind b = do
-  ts <- get
-  let (sb,bb) = blind ts
-  foldM doBet b [sb,bb]
+nextPlayers :: GS -> [Player]
+nextPlayers gs = a++b
+    where 
+      ps = players gs
+      n = M.size ps
+      next = (current gs+1) `mod` n
+      (a,b) = splitAt next [0..n-1]
 
-printState :: TS -> Board -> Player -> IO ()
-printState ts b p = return ()
+nextPlayer :: GS -> Player
+nextPlayer gs = first ((==Active).(ps!)) lis
+    where 
+      ps = players gs
+      lis = nextPlayers gs
+                
+io :: IO a -> TS a
+io = liftIO
 
-type GameState a = StateT TS IO a
+printBoard :: GS -> Table -> IO ()
+printBoard g t = do
+  putStrLn $ "scores: " ++ show (M.toList $ scores t)
+  putStrLn $ "board: " ++ show (board g)
+  putStrLn $ "pot: " ++ show (M.foldl (+) 0 $ pot g)
+  putStrLn $ "player: " ++ show (nextPlayer g)
 
-preFlop :: Board -> GameState Board
-preFlop b = do
-  ts <- get
-  lift $ printState ts b $ head $ active b
-  return b
+getBet :: GS -> TS Score
+getBet g = do
+    let mb = minBet g
+    io $ putStrLn $ "minimum bet = " ++ show mb
+    io $ putStrLn "your action? [(f)old or (c)all or (b)et/raise]"
+    line <- io $ getLine
+    case (head line) of
+      'f' -> return 0
+      'c' -> return mb
+      'b' -> do
+        io $ putStrLn "bet amount? "
+        line1 <- io $ getLine
+        return (read line1 :: Int)
 
-playGame :: TS -> Cards -> IO TS
-playGame ts cards = do
-  print cards
-  putStrLn "your action. [(c)all or (f)old or (r)aise]"
-  line <- getLine
-  return ts
+doBetAround :: GS -> TS GS
+doBetAround g = do
+  t <- get
+  io $ printBoard g t
+  bet <- getBet g
+  doBet (nextPlayer g) bet g
+
+doPreflop :: GS -> TS GS
+doPreflop gs = do
+  gs1 <- doAnteBets gs
+  t <- get
+  let [sb,bb] = blind t
+  gs2 <- doBet (nextPlayer gs1) sb gs1
+  gs3 <- doBet (nextPlayer gs2) bb gs2
+  doBetAround gs3
+
+openOne :: GS -> GS
+openOne gs =
+  let (c1:d1) = deck gs
+  in gs {deck=d1,board=board gs++[c1]}
+
+doFlop :: GS -> TS GS
+doFlop = doBetAround.openOne.openOne.openOne
+
+doTurn :: GS -> TS GS
+doTurn = doBetAround.openOne
+
+doRiver :: GS -> TS GS
+doRiver = doBetAround.openOne
+
+doGame :: Cards -> TS GS
+doGame cards = do
+  g <- initGameState cards
+  foldM (flip ($)) g [doPreflop,doFlop,doTurn,doRiver]
 
 -- Main 
 
@@ -162,19 +219,11 @@ main = do
   putStrLn "num player? [2-10]"
   line <- getLine
   let np = read line
-  repeatGames (initTable np) (randoms g)
+  repeatGames (randoms g) (initTable np)
 
-repeatGames :: TS -> RandInts -> IO ()
-repeatGames ts rs = do
+repeatGames :: RandInts -> Table -> IO ()
+repeatGames rs t = do
   let (rs1,rs2) = splitAt 52 rs
       cards = shuffle rs1 initCards
-  ts1 <- playGame ts cards
-  let np1 = nplayers ts1
-      win = showWin ts1
-      next = repeatGames ts1 rs2
-  if np1==1 then win else next
-
-showWin :: TS -> IO ()
-showWin ts = do
-  let Just p = findIndex (>0) $ scores ts
-  print $ "player " ++ show (p+1) ++ " win!"
+  execStateT (doGame cards) t >>= repeatGames rs2
+  
